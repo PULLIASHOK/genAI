@@ -1,0 +1,220 @@
+# Research Summarization Smart Assistant
+import streamlit as st
+from transformers import pipeline
+from PyPDF2 import PdfReader
+from typing import List, Dict, Tuple
+import textwrap
+import nltk
+from nltk.tokenize import sent_tokenize
+import random
+
+# Download NLTK data (first time only)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+# Initialize models
+@st.cache_resource
+
+
+def load_models():
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    qa_model = pipeline("question-answering", model="deepset/roberta-base-squad2")
+    
+    # 👇 This is the crucial change
+    qg_model = pipeline(
+        "text2text-generation",
+        model="mrm8488/t5-base-finetuned-question-generation-ap",
+        tokenizer="mrm8488/t5-base-finetuned-question-generation-ap",
+        use_fast=False
+    )
+
+    return summarizer, qa_model, qg_model
+
+
+# Document processing functions
+def extract_text_from_pdf(file) -> str:
+    pdf_reader = PdfReader(file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
+
+def extract_text_from_txt(file) -> str:
+    return file.read().decode("utf-8")
+
+def generate_summary(text: str) -> str:
+    # Split text into chunks that the model can handle
+    max_chunk_length = 1024
+    chunks = textwrap.wrap(text, max_chunk_length)
+    
+    summaries = []
+    for chunk in chunks:
+        summary = summarizer(chunk, max_length=150, min_length=30, do_sample=False)
+        summaries.append(summary[0]['summary_text'])
+    
+    # Combine summaries if there are multiple
+    if len(summaries) > 1:
+        combined_summary = " ".join(summaries)
+        final_summary = summarizer(combined_summary, max_length=150, min_length=30, do_sample=False)
+        return final_summary[0]['summary_text']
+    else:
+        return summaries[0]
+
+def generate_questions(text: str, num_questions: int = 3) -> List[Dict[str, str]]:
+    # Split text into sentences
+    sentences = sent_tokenize(text)
+    
+    # Filter longer sentences as they tend to have more information
+    sentences = [s for s in sentences if len(s.split()) > 10]
+    
+    # Select random sentences to generate questions from
+    selected_sentences = random.sample(sentences, min(num_questions, len(sentences)))
+    
+    questions = []
+    for sentence in selected_sentences:
+        # Generate question
+        input_text = f"generate question: {sentence}"
+        question = qg_model(input_text, max_length=64, num_return_sequences=1)[0]['generated_text']
+        
+        # Get answer to the question
+        answer = qa_model(question=question, context=text)
+        
+        questions.append({
+            "question": question,
+            "answer": answer['answer'],
+            "context": answer['context']
+        })
+    
+    return questions
+
+def answer_question(text: str, question: str) -> Dict[str, str]:
+    result = qa_model(question=question, context=text)
+    return {
+        "answer": result['answer'],
+        "context": result['context'],
+        "score": result['score']
+    }
+
+def evaluate_user_answer(correct_answer: str, user_answer: str) -> Tuple[str, str]:
+    # Simple evaluation - could be enhanced with semantic similarity
+    correct_lower = correct_answer.lower()
+    user_lower = user_answer.lower()
+    
+    if user_lower in correct_lower or correct_lower in user_lower:
+        return "Correct!", "Your answer matches the expected answer."
+    else:
+        return "Incorrect!", f"The correct answer is: {correct_answer}"
+
+# Streamlit UI
+def main():
+    st.title("Research Summarization Smart Assistant")
+    st.write("Upload a document (PDF or TXT) to get started.")
+    
+    # Initialize session state
+    if 'document_text' not in st.session_state:
+        st.session_state.document_text = None
+    if 'summary' not in st.session_state:
+        st.session_state.summary = None
+    if 'questions' not in st.session_state:
+        st.session_state.questions = None
+    if 'current_mode' not in st.session_state:
+        st.session_state.current_mode = None
+    if 'user_answers' not in st.session_state:
+        st.session_state.user_answers = {}
+    if 'evaluations' not in st.session_state:
+        st.session_state.evaluations = {}
+    
+    # Document upload
+    uploaded_file = st.file_uploader("Choose a file", type=["pdf", "txt"])
+    
+    if uploaded_file is not None:
+        if st.session_state.document_text is None:
+            with st.spinner("Processing document..."):
+                if uploaded_file.type == "application/pdf":
+                    text = extract_text_from_pdf(uploaded_file)
+                else:
+                    text = extract_text_from_txt(uploaded_file)
+                
+                st.session_state.document_text = text
+                st.session_state.summary = generate_summary(text)
+        
+        st.success("Document processed successfully!")
+        st.subheader("Document Summary")
+        st.write(st.session_state.summary)
+        
+        # Mode selection
+        st.subheader("Select Interaction Mode")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Ask Anything Mode"):
+                st.session_state.current_mode = "ask"
+                st.session_state.questions = None
+        
+        with col2:
+            if st.button("Challenge Me Mode"):
+                st.session_state.current_mode = "challenge"
+                if st.session_state.questions is None:
+                    with st.spinner("Generating questions..."):
+                        st.session_state.questions = generate_questions(st.session_state.document_text)
+        
+        # Handle current mode
+        if st.session_state.current_mode == "ask":
+            st.subheader("Ask Anything Mode")
+            question = st.text_input("Enter your question about the document:")
+            
+            if question:
+                with st.spinner("Finding answer..."):
+                    answer_result = answer_question(st.session_state.document_text, question)
+                
+                st.markdown("### Answer:")
+                st.write(answer_result['answer'])
+                
+                st.markdown("### Supporting Context:")
+                st.write(answer_result['context'])
+                
+                st.markdown(f"### Confidence Score: {answer_result['score']:.2f}")
+        
+        elif st.session_state.current_mode == "challenge":
+            st.subheader("Challenge Me Mode")
+            
+            if st.session_state.questions:
+                for i, q in enumerate(st.session_state.questions):
+                    st.markdown(f"### Question {i+1}")
+                    st.write(q['question'])
+                    
+                    # Get user answer
+                    user_answer_key = f"user_answer_{i}"
+                    if user_answer_key not in st.session_state.user_answers:
+                        st.session_state.user_answers[user_answer_key] = ""
+                    
+                    user_answer = st.text_input(f"Your answer to question {i+1}:", 
+                                               key=user_answer_key)
+                    
+                    # Evaluate button
+                    eval_key = f"eval_{i}"
+                    if st.button(f"Evaluate Answer {i+1}", key=eval_key):
+                        evaluation = evaluate_user_answer(q['answer'], user_answer)
+                        st.session_state.evaluations[i] = evaluation
+                    
+                    # Show evaluation if available
+                    if i in st.session_state.evaluations:
+                        eval_result, eval_detail = st.session_state.evaluations[i]
+                        if eval_result == "Correct!":
+                            st.success(f"{eval_result} {eval_detail}")
+                        else:
+                            st.error(f"{eval_result} {eval_detail}")
+                
+                if st.button("Generate New Questions"):
+                    with st.spinner("Generating new questions..."):
+                        st.session_state.questions = generate_questions(st.session_state.document_text)
+                    st.session_state.user_answers = {}
+                    st.session_state.evaluations = {}
+                    st.experimental_rerun()
+
+if __name__ == "__main__":
+    main()
+
+
